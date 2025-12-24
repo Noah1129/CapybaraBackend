@@ -295,9 +295,136 @@ app.get('/api/pvp/leaderboard', async (req, res) => {
     }
 });
 
-// ================= SOCKET.IO - REAL-TIME PVP =================
+// ================= SOCKET.IO - TURN-BASED PVP =================
 const waitingPlayers = [];
 const activeMatches = new Map();
+
+// Battle state structure per match
+const createBattleState = (player1, player2) => ({
+    turn: 1,
+    players: {
+        [player1.playerId]: {
+            ...player1,
+            hp: 100,
+            maxHp: 100,
+            action: null,
+            specialCooldown: 0
+        },
+        [player2.playerId]: {
+            ...player2,
+            hp: 100,
+            maxHp: 100,
+            action: null,
+            specialCooldown: 0
+        }
+    },
+    playerIds: [player1.playerId, player2.playerId],
+    status: 'waiting_actions' // 'waiting_actions', 'resolving', 'finished'
+});
+
+// Resolve turn when both players have submitted actions
+const resolveTurn = (matchId, match) => {
+    const battle = match.battleState;
+    const [p1Id, p2Id] = battle.playerIds;
+    const p1 = battle.players[p1Id];
+    const p2 = battle.players[p2Id];
+
+    // Calculate damage
+    let p1Damage = 0;
+    let p2Damage = 0;
+
+    // Player 1 action
+    if (p1.action === 'attack') {
+        p1Damage = 15 + Math.floor(Math.random() * 11); // 15-25
+    } else if (p1.action === 'special' && p1.specialCooldown === 0) {
+        p1Damage = 30;
+        p1.specialCooldown = 2;
+    }
+
+    // Player 2 action
+    if (p2.action === 'attack') {
+        p2Damage = 15 + Math.floor(Math.random() * 11);
+    } else if (p2.action === 'special' && p2.specialCooldown === 0) {
+        p2Damage = 30;
+        p2.specialCooldown = 2;
+    }
+
+    // Apply defense reduction
+    if (p2.action === 'defend') p1Damage = Math.floor(p1Damage * 0.5);
+    if (p1.action === 'defend') p2Damage = Math.floor(p2Damage * 0.5);
+
+    // Apply damage
+    p1.hp = Math.max(0, p1.hp - p2Damage);
+    p2.hp = Math.max(0, p2.hp - p1Damage);
+
+    // Reduce cooldowns
+    if (p1.specialCooldown > 0 && p1.action !== 'special') p1.specialCooldown--;
+    if (p2.specialCooldown > 0 && p2.action !== 'special') p2.specialCooldown--;
+
+    // Prepare turn result
+    const turnResult = {
+        turn: battle.turn,
+        actions: {
+            [p1Id]: p1.action,
+            [p2Id]: p2.action
+        },
+        damage: {
+            [p1Id]: p2Damage, // Damage taken by p1
+            [p2Id]: p1Damage  // Damage taken by p2
+        },
+        hp: {
+            [p1Id]: p1.hp,
+            [p2Id]: p2.hp
+        },
+        specialCooldown: {
+            [p1Id]: p1.specialCooldown,
+            [p2Id]: p2.specialCooldown
+        }
+    };
+
+    // Check for winner
+    let winner = null;
+    if (p1.hp <= 0 && p2.hp <= 0) {
+        winner = p1.hp > p2.hp ? p1Id : p2Id; // Whoever has more HP wins tie
+    } else if (p1.hp <= 0) {
+        winner = p2Id;
+    } else if (p2.hp <= 0) {
+        winner = p1Id;
+    }
+
+    // Send turn result to both players
+    match.players.forEach(p => {
+        io.to(p.socketId).emit('pvp:turn_result', {
+            ...turnResult,
+            yourId: p.playerId,
+            opponentId: p.playerId === p1Id ? p2Id : p1Id
+        });
+    });
+
+    if (winner) {
+        battle.status = 'finished';
+        const winnerTrophyGain = 20;
+        const loserTrophyLoss = 10;
+
+        match.players.forEach(p => {
+            const isWinner = p.playerId === winner;
+            io.to(p.socketId).emit('pvp:battle_end', {
+                winner: winner,
+                won: isWinner,
+                trophyChange: isWinner ? winnerTrophyGain : -loserTrophyLoss
+            });
+        });
+
+        console.log(`🏆 Match ${matchId} ended. Winner: ${winner}`);
+        activeMatches.delete(matchId);
+    } else {
+        // Reset actions for next turn
+        p1.action = null;
+        p2.action = null;
+        battle.turn++;
+        battle.status = 'waiting_actions';
+    }
+};
 
 io.on('connection', (socket) => {
     console.log('🔌 Player connected:', socket.id);
@@ -306,7 +433,6 @@ io.on('connection', (socket) => {
     socket.on('pvp:queue', (playerData) => {
         console.log('📋 Player queued:', playerData.username);
 
-        // Remove from queue if already there
         const existingIndex = waitingPlayers.findIndex(p => p.playerId === playerData.playerId);
         if (existingIndex > -1) waitingPlayers.splice(existingIndex, 1);
 
@@ -319,8 +445,6 @@ io.on('connection', (socket) => {
         });
 
         socket.emit('pvp:queued', { position: waitingPlayers.length });
-
-        // Try to match
         tryMatchPlayers();
     });
 
@@ -330,56 +454,52 @@ io.on('connection', (socket) => {
         if (index > -1) waitingPlayers.splice(index, 1);
     });
 
-    // Combat action
-    socket.on('pvp:action', (data) => {
-        const match = activeMatches.get(data.matchId);
-        if (!match) return;
+    // Submit turn action
+    socket.on('pvp:submit_action', (data) => {
+        const { matchId, action } = data;
+        const match = activeMatches.get(matchId);
+        if (!match || match.battleState.status !== 'waiting_actions') return;
 
+        // Find which player this is
+        const player = match.players.find(p => p.socketId === socket.id);
+        if (!player) return;
+
+        const battlePlayer = match.battleState.players[player.playerId];
+        if (!battlePlayer || battlePlayer.action) return; // Already submitted
+
+        // Validate action
+        if (!['attack', 'defend', 'special'].includes(action)) return;
+        if (action === 'special' && battlePlayer.specialCooldown > 0) {
+            socket.emit('pvp:action_error', { error: 'Special is on cooldown!' });
+            return;
+        }
+
+        battlePlayer.action = action;
+        console.log(`⚔️ ${player.username} chose: ${action}`);
+
+        // Notify opponent that we're ready
         const opponent = match.players.find(p => p.socketId !== socket.id);
         if (opponent) {
-            io.to(opponent.socketId).emit('pvp:opponent_action', data);
-        }
-    });
-
-    // Combat result
-    socket.on('pvp:result', async (data) => {
-        const match = activeMatches.get(data.matchId);
-        if (!match) return;
-
-        // Calculate trophy changes
-        const winnerTrophyGain = 15 + Math.floor(Math.random() * 10);
-        const loserTrophyLoss = Math.min(10, Math.floor(data.loserTrophies * 0.1));
-
-        // Notify both players
-        match.players.forEach(p => {
-            const isWinner = p.playerId === data.winnerId;
-            io.to(p.socketId).emit('pvp:match_end', {
-                won: isWinner,
-                trophyChange: isWinner ? winnerTrophyGain : -loserTrophyLoss
-            });
-        });
-
-        // Save match to DB
-        try {
-            await pool.query(
-                'INSERT INTO pvp_matches (player1_id, player2_id, winner_id, player1_trophies_change, player2_trophies_change) VALUES ($1, $2, $3, $4, $5)',
-                [match.players[0].playerId, match.players[1].playerId, data.winnerId, winnerTrophyGain, -loserTrophyLoss]
-            );
-        } catch (err) {
-            console.error('Match save error:', err);
+            io.to(opponent.socketId).emit('pvp:opponent_ready');
         }
 
-        activeMatches.delete(data.matchId);
+        // Check if both players have submitted
+        const allSubmitted = match.battleState.playerIds.every(
+            id => match.battleState.players[id].action !== null
+        );
+
+        if (allSubmitted) {
+            match.battleState.status = 'resolving';
+            resolveTurn(matchId, match);
+        }
     });
 
     socket.on('disconnect', () => {
         console.log('🔌 Player disconnected:', socket.id);
 
-        // Remove from queue
         const index = waitingPlayers.findIndex(p => p.socketId === socket.id);
         if (index > -1) waitingPlayers.splice(index, 1);
 
-        // Handle mid-match disconnect
         activeMatches.forEach((match, matchId) => {
             if (match.players.some(p => p.socketId === socket.id)) {
                 const opponent = match.players.find(p => p.socketId !== socket.id);
@@ -396,39 +516,44 @@ io.on('connection', (socket) => {
 function tryMatchPlayers() {
     if (waitingPlayers.length < 2) return;
 
-    // Simple matchmaking - match first two in queue
-    // In production, you'd match by trophy range
     const player1 = waitingPlayers.shift();
     const player2 = waitingPlayers.shift();
 
     const matchId = uuidv4();
 
-    activeMatches.set(matchId, {
+    const match = {
         id: matchId,
         players: [player1, player2],
+        battleState: createBattleState(player1, player2),
         startedAt: Date.now()
-    });
+    };
 
-    // Notify both players
+    activeMatches.set(matchId, match);
+
+    // Notify both players with battle info
     io.to(player1.socketId).emit('pvp:match_found', {
         matchId,
+        yourId: player1.playerId,
         opponent: {
+            id: player2.playerId,
             username: player2.username,
-            stats: player2.stats,
             trophies: player2.trophies
-        }
+        },
+        startHp: 100
     });
 
     io.to(player2.socketId).emit('pvp:match_found', {
         matchId,
+        yourId: player2.playerId,
         opponent: {
+            id: player1.playerId,
             username: player1.username,
-            stats: player1.stats,
             trophies: player1.trophies
-        }
+        },
+        startHp: 100
     });
 
-    console.log(`⚔️ Match started: ${player1.username} vs ${player2.username}`);
+    console.log(`⚔️ Turn-based match started: ${player1.username} vs ${player2.username}`);
 }
 
 // ================= START SERVER =================
