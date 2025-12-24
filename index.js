@@ -914,6 +914,536 @@ function tryMatchPlayers() {
     console.log(`⚔️ Turn-based match started: ${player1.username} vs ${player2.username}`);
 }
 
+// ================= GUILD SYSTEM =================
+
+// In-memory guild storage (also persisted to DB if available)
+const guilds = new Map();
+const guildInvites = new Map(); // playerId -> array of guild invites
+const guildBossDamage = new Map(); // guildId -> { playerId: damage }
+
+// Guild boss config
+const GUILD_BOSS = {
+    maxHp: 10000000, // 10 million
+    dailyAttacks: 3,
+    coinsPerDamage: 1000, // 1 coin per 1000 damage
+};
+
+// Initialize guild tables in DB
+const initGuildTables = async () => {
+    if (!pool) return;
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS guilds (
+                id VARCHAR(50) PRIMARY KEY,
+                name VARCHAR(50) NOT NULL UNIQUE,
+                leader_id VARCHAR(50) REFERENCES players(id),
+                level INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT NOW(),
+                boss_hp INTEGER DEFAULT 10000000,
+                boss_last_reset DATE DEFAULT CURRENT_DATE
+            );
+            
+            CREATE TABLE IF NOT EXISTS guild_members (
+                guild_id VARCHAR(50) REFERENCES guilds(id) ON DELETE CASCADE,
+                player_id VARCHAR(50) REFERENCES players(id) ON DELETE CASCADE,
+                role VARCHAR(20) DEFAULT 'member',
+                guild_coins INTEGER DEFAULT 0,
+                joined_at TIMESTAMP DEFAULT NOW(),
+                daily_attacks INTEGER DEFAULT 3,
+                last_attack_date DATE DEFAULT CURRENT_DATE,
+                PRIMARY KEY (guild_id, player_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS guild_boss_damage (
+                guild_id VARCHAR(50) REFERENCES guilds(id) ON DELETE CASCADE,
+                player_id VARCHAR(50) REFERENCES players(id) ON DELETE CASCADE,
+                damage INTEGER DEFAULT 0,
+                damage_date DATE DEFAULT CURRENT_DATE,
+                PRIMARY KEY (guild_id, player_id, damage_date)
+            );
+            
+            CREATE TABLE IF NOT EXISTS guild_invites (
+                id SERIAL PRIMARY KEY,
+                guild_id VARCHAR(50) REFERENCES guilds(id) ON DELETE CASCADE,
+                from_player_id VARCHAR(50) REFERENCES players(id),
+                to_player_id VARCHAR(50) REFERENCES players(id),
+                status VARCHAR(20) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        console.log('✅ Guild tables initialized');
+    } catch (err) {
+        console.log('⚠️ Guild tables error:', err.message);
+    }
+};
+
+// Create guild
+app.post('/api/guilds/create', async (req, res) => {
+    const { playerId, guildName } = req.body;
+
+    if (!playerId || !guildName || guildName.length < 3) {
+        return res.status(400).json({ error: 'Guild name must be at least 3 characters' });
+    }
+
+    try {
+        // Check if player already in a guild
+        if (pool) {
+            const existing = await pool.query(
+                'SELECT guild_id FROM guild_members WHERE player_id = $1',
+                [playerId]
+            );
+            if (existing.rows.length > 0) {
+                return res.status(400).json({ error: 'You are already in a guild' });
+            }
+
+            // Check if guild name taken
+            const nameTaken = await pool.query(
+                'SELECT id FROM guilds WHERE LOWER(name) = LOWER($1)',
+                [guildName]
+            );
+            if (nameTaken.rows.length > 0) {
+                return res.status(400).json({ error: 'Guild name already taken' });
+            }
+
+            // Create guild
+            const guildId = uuidv4();
+            await pool.query(
+                'INSERT INTO guilds (id, name, leader_id) VALUES ($1, $2, $3)',
+                [guildId, guildName, playerId]
+            );
+
+            // Add leader as member
+            await pool.query(
+                'INSERT INTO guild_members (guild_id, player_id, role) VALUES ($1, $2, $3)',
+                [guildId, playerId, 'leader']
+            );
+
+            res.json({
+                success: true,
+                guild: { id: guildId, name: guildName, level: 1 }
+            });
+        } else {
+            // In-memory fallback
+            const guildId = uuidv4();
+            guilds.set(guildId, {
+                id: guildId,
+                name: guildName,
+                leaderId: playerId,
+                level: 1,
+                members: [{ playerId, role: 'leader', guildCoins: 0 }],
+                bossHp: GUILD_BOSS.maxHp,
+            });
+            res.json({ success: true, guild: { id: guildId, name: guildName, level: 1 } });
+        }
+    } catch (err) {
+        console.error('Create guild error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// List all guilds
+app.get('/api/guilds', async (req, res) => {
+    try {
+        if (pool) {
+            const result = await pool.query(`
+                SELECT g.*, 
+                    (SELECT COUNT(*) FROM guild_members WHERE guild_id = g.id) as member_count,
+                    p.username as leader_name
+                FROM guilds g
+                LEFT JOIN players p ON g.leader_id = p.id
+                ORDER BY g.level DESC, g.created_at DESC
+                LIMIT 50
+            `);
+            res.json({ guilds: result.rows });
+        } else {
+            const guildList = Array.from(guilds.values()).map(g => ({
+                ...g,
+                member_count: g.members.length
+            }));
+            res.json({ guilds: guildList });
+        }
+    } catch (err) {
+        console.error('List guilds error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get guild details
+app.get('/api/guilds/:guildId', async (req, res) => {
+    const { guildId } = req.params;
+
+    try {
+        if (pool) {
+            const guildResult = await pool.query('SELECT * FROM guilds WHERE id = $1', [guildId]);
+            if (guildResult.rows.length === 0) {
+                return res.status(404).json({ error: 'Guild not found' });
+            }
+
+            const membersResult = await pool.query(`
+                SELECT gm.*, p.username, p.trophies
+                FROM guild_members gm
+                JOIN players p ON gm.player_id = p.id
+                WHERE gm.guild_id = $1
+                ORDER BY gm.role = 'leader' DESC, gm.joined_at ASC
+            `, [guildId]);
+
+            // Get today's boss damage
+            const damageResult = await pool.query(`
+                SELECT player_id, damage FROM guild_boss_damage
+                WHERE guild_id = $1 AND damage_date = CURRENT_DATE
+                ORDER BY damage DESC
+            `, [guildId]);
+
+            res.json({
+                guild: guildResult.rows[0],
+                members: membersResult.rows,
+                bossDamage: damageResult.rows
+            });
+        } else {
+            const guild = guilds.get(guildId);
+            if (!guild) {
+                return res.status(404).json({ error: 'Guild not found' });
+            }
+            res.json({ guild, members: guild.members, bossDamage: [] });
+        }
+    } catch (err) {
+        console.error('Get guild error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get player's guild
+app.get('/api/guilds/player/:playerId', async (req, res) => {
+    const { playerId } = req.params;
+
+    try {
+        if (pool) {
+            const result = await pool.query(`
+                SELECT g.*, gm.role, gm.guild_coins, gm.daily_attacks
+                FROM guild_members gm
+                JOIN guilds g ON gm.guild_id = g.id
+                WHERE gm.player_id = $1
+            `, [playerId]);
+
+            if (result.rows.length === 0) {
+                return res.json({ guild: null });
+            }
+
+            // Get member count
+            const memberCount = await pool.query(
+                'SELECT COUNT(*) FROM guild_members WHERE guild_id = $1',
+                [result.rows[0].id]
+            );
+
+            res.json({
+                guild: {
+                    ...result.rows[0],
+                    member_count: parseInt(memberCount.rows[0].count)
+                }
+            });
+        } else {
+            for (const guild of guilds.values()) {
+                const member = guild.members.find(m => m.playerId === playerId);
+                if (member) {
+                    return res.json({ guild: { ...guild, role: member.role } });
+                }
+            }
+            res.json({ guild: null });
+        }
+    } catch (err) {
+        console.error('Get player guild error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Join guild
+app.post('/api/guilds/:guildId/join', async (req, res) => {
+    const { guildId } = req.params;
+    const { playerId } = req.body;
+
+    try {
+        if (pool) {
+            // Check if already in a guild
+            const existing = await pool.query(
+                'SELECT guild_id FROM guild_members WHERE player_id = $1',
+                [playerId]
+            );
+            if (existing.rows.length > 0) {
+                return res.status(400).json({ error: 'Already in a guild' });
+            }
+
+            // Check guild exists
+            const guild = await pool.query('SELECT * FROM guilds WHERE id = $1', [guildId]);
+            if (guild.rows.length === 0) {
+                return res.status(404).json({ error: 'Guild not found' });
+            }
+
+            // Join
+            await pool.query(
+                'INSERT INTO guild_members (guild_id, player_id, role) VALUES ($1, $2, $3)',
+                [guildId, playerId, 'member']
+            );
+
+            res.json({ success: true });
+        } else {
+            const guild = guilds.get(guildId);
+            if (!guild) return res.status(404).json({ error: 'Guild not found' });
+            guild.members.push({ playerId, role: 'member', guildCoins: 0 });
+            res.json({ success: true });
+        }
+    } catch (err) {
+        console.error('Join guild error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Leave guild
+app.post('/api/guilds/:guildId/leave', async (req, res) => {
+    const { guildId } = req.params;
+    const { playerId } = req.body;
+
+    try {
+        if (pool) {
+            // Check if leader
+            const guild = await pool.query('SELECT leader_id FROM guilds WHERE id = $1', [guildId]);
+            if (guild.rows[0]?.leader_id === playerId) {
+                return res.status(400).json({ error: 'Leader cannot leave. Transfer leadership first.' });
+            }
+
+            await pool.query(
+                'DELETE FROM guild_members WHERE guild_id = $1 AND player_id = $2',
+                [guildId, playerId]
+            );
+            res.json({ success: true });
+        } else {
+            const guild = guilds.get(guildId);
+            if (!guild) return res.status(404).json({ error: 'Guild not found' });
+            guild.members = guild.members.filter(m => m.playerId !== playerId);
+            res.json({ success: true });
+        }
+    } catch (err) {
+        console.error('Leave guild error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Send invite
+app.post('/api/guilds/:guildId/invite', async (req, res) => {
+    const { guildId } = req.params;
+    const { fromPlayerId, toUsername } = req.body;
+
+    try {
+        if (pool) {
+            // Find target player
+            const target = await pool.query(
+                'SELECT id FROM players WHERE LOWER(username) = LOWER($1)',
+                [toUsername]
+            );
+            if (target.rows.length === 0) {
+                return res.status(404).json({ error: 'Player not found' });
+            }
+            const toPlayerId = target.rows[0].id;
+
+            // Check if already in guild
+            const existing = await pool.query(
+                'SELECT guild_id FROM guild_members WHERE player_id = $1',
+                [toPlayerId]
+            );
+            if (existing.rows.length > 0) {
+                return res.status(400).json({ error: 'Player is already in a guild' });
+            }
+
+            // Create invite
+            await pool.query(
+                'INSERT INTO guild_invites (guild_id, from_player_id, to_player_id) VALUES ($1, $2, $3)',
+                [guildId, fromPlayerId, toPlayerId]
+            );
+
+            res.json({ success: true });
+        } else {
+            res.json({ success: true, message: 'Invite sent (in-memory mode)' });
+        }
+    } catch (err) {
+        console.error('Invite error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get pending invites for player
+app.get('/api/guilds/invites/:playerId', async (req, res) => {
+    const { playerId } = req.params;
+
+    try {
+        if (pool) {
+            const result = await pool.query(`
+                SELECT gi.*, g.name as guild_name, p.username as from_username
+                FROM guild_invites gi
+                JOIN guilds g ON gi.guild_id = g.id
+                JOIN players p ON gi.from_player_id = p.id
+                WHERE gi.to_player_id = $1 AND gi.status = 'pending'
+            `, [playerId]);
+            res.json({ invites: result.rows });
+        } else {
+            res.json({ invites: guildInvites.get(playerId) || [] });
+        }
+    } catch (err) {
+        console.error('Get invites error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Accept invite
+app.post('/api/guilds/invites/:inviteId/accept', async (req, res) => {
+    const { inviteId } = req.params;
+    const { playerId } = req.body;
+
+    try {
+        if (pool) {
+            // Get invite
+            const invite = await pool.query(
+                'SELECT * FROM guild_invites WHERE id = $1 AND to_player_id = $2 AND status = $3',
+                [inviteId, playerId, 'pending']
+            );
+            if (invite.rows.length === 0) {
+                return res.status(404).json({ error: 'Invite not found' });
+            }
+
+            const guildId = invite.rows[0].guild_id;
+
+            // Join guild
+            await pool.query(
+                'INSERT INTO guild_members (guild_id, player_id, role) VALUES ($1, $2, $3)',
+                [guildId, playerId, 'member']
+            );
+
+            // Mark invite as accepted
+            await pool.query(
+                'UPDATE guild_invites SET status = $1 WHERE id = $2',
+                ['accepted', inviteId]
+            );
+
+            res.json({ success: true, guildId });
+        } else {
+            res.json({ success: true });
+        }
+    } catch (err) {
+        console.error('Accept invite error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Attack guild boss
+app.post('/api/guilds/:guildId/boss/attack', async (req, res) => {
+    const { guildId } = req.params;
+    const { playerId } = req.body;
+
+    // Random damage between 50k-150k
+    const damage = Math.floor(50000 + Math.random() * 100000);
+    const coinsEarned = Math.floor(damage / GUILD_BOSS.coinsPerDamage);
+
+    try {
+        if (pool) {
+            // Check attacks remaining
+            const member = await pool.query(`
+                SELECT daily_attacks, last_attack_date 
+                FROM guild_members 
+                WHERE guild_id = $1 AND player_id = $2
+            `, [guildId, playerId]);
+
+            if (member.rows.length === 0) {
+                return res.status(400).json({ error: 'Not a guild member' });
+            }
+
+            let attacksLeft = member.rows[0].daily_attacks;
+            const lastDate = member.rows[0].last_attack_date;
+            const today = new Date().toISOString().split('T')[0];
+
+            // Reset if new day
+            if (lastDate !== today) {
+                attacksLeft = GUILD_BOSS.dailyAttacks;
+            }
+
+            if (attacksLeft <= 0) {
+                return res.status(400).json({ error: 'No attacks remaining today' });
+            }
+
+            // Record damage
+            await pool.query(`
+                INSERT INTO guild_boss_damage (guild_id, player_id, damage, damage_date)
+                VALUES ($1, $2, $3, CURRENT_DATE)
+                ON CONFLICT (guild_id, player_id, damage_date)
+                DO UPDATE SET damage = guild_boss_damage.damage + $3
+            `, [guildId, playerId, damage]);
+
+            // Update attacks and coins
+            await pool.query(`
+                UPDATE guild_members 
+                SET daily_attacks = $1, last_attack_date = CURRENT_DATE, guild_coins = guild_coins + $2
+                WHERE guild_id = $3 AND player_id = $4
+            `, [attacksLeft - 1, coinsEarned, guildId, playerId]);
+
+            // Update guild boss HP
+            await pool.query(`
+                UPDATE guilds SET boss_hp = GREATEST(0, boss_hp - $1) WHERE id = $2
+            `, [damage, guildId]);
+
+            res.json({
+                success: true,
+                damage,
+                coinsEarned,
+                attacksLeft: attacksLeft - 1
+            });
+        } else {
+            const guild = guilds.get(guildId);
+            if (!guild) return res.status(404).json({ error: 'Guild not found' });
+            guild.bossHp = Math.max(0, guild.bossHp - damage);
+            res.json({ success: true, damage, coinsEarned, attacksLeft: 2 });
+        }
+    } catch (err) {
+        console.error('Boss attack error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get boss status
+app.get('/api/guilds/:guildId/boss', async (req, res) => {
+    const { guildId } = req.params;
+
+    try {
+        if (pool) {
+            const guild = await pool.query('SELECT boss_hp FROM guilds WHERE id = $1', [guildId]);
+            const damage = await pool.query(`
+                SELECT gbd.player_id, gbd.damage, p.username
+                FROM guild_boss_damage gbd
+                JOIN players p ON gbd.player_id = p.id
+                WHERE gbd.guild_id = $1 AND gbd.damage_date = CURRENT_DATE
+                ORDER BY gbd.damage DESC
+                LIMIT 10
+            `, [guildId]);
+
+            res.json({
+                bossHp: guild.rows[0]?.boss_hp || GUILD_BOSS.maxHp,
+                maxHp: GUILD_BOSS.maxHp,
+                leaderboard: damage.rows
+            });
+        } else {
+            const guild = guilds.get(guildId);
+            res.json({
+                bossHp: guild?.bossHp || GUILD_BOSS.maxHp,
+                maxHp: GUILD_BOSS.maxHp,
+                leaderboard: []
+            });
+        }
+    } catch (err) {
+        console.error('Get boss status error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Initialize guild tables on startup
+initGuildTables();
+
+
 // ================= START SERVER =================
 const PORT = process.env.PORT || 3001;
 
