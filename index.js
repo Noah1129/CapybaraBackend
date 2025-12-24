@@ -1443,6 +1443,343 @@ app.get('/api/guilds/:guildId/boss', async (req, res) => {
 // Initialize guild tables on startup
 initGuildTables();
 
+// ================= CLAN WARS SYSTEM =================
+
+// In-memory war storage
+const activeWars = new Map(); // warId -> warState
+const guildToWar = new Map(); // guildId -> warId
+const warQueue = []; // Guilds waiting for matchmaking
+
+// War state structure:
+// { id, guild1: {id, name, emoji, members[]}, guild2: {id, name, emoji, members[]}, 
+//   scores: {guild1: 0, guild2: 0}, attacks: [], phase: 'battle'|'ended', 
+//   startedAt, endsAt, winner }
+
+// Socket.io connection handlers for clan wars
+io.on('connection', (socket) => {
+    console.log('🔌 Socket connected:', socket.id);
+
+    // Join a war room for real-time updates
+    socket.on('join_war', (warId) => {
+        socket.join(`war:${warId}`);
+        console.log(`👥 Socket ${socket.id} joined war:${warId}`);
+    });
+
+    // Leave war room
+    socket.on('leave_war', (warId) => {
+        socket.leave(`war:${warId}`);
+        console.log(`👋 Socket ${socket.id} left war:${warId}`);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('🔌 Socket disconnected:', socket.id);
+    });
+});
+
+// Helper to broadcast war update to all participants
+const broadcastWarUpdate = (warId, event, data) => {
+    io.to(`war:${warId}`).emit(event, data);
+};
+
+// Get guild info helper
+const getGuildInfo = async (guildId) => {
+    if (pool) {
+        const result = await pool.query(`
+            SELECT g.id, g.name, g.emoji, 
+                   (SELECT COUNT(*) FROM guild_members WHERE guild_id = g.id) as member_count
+            FROM guilds g WHERE g.id = $1
+        `, [guildId]);
+        if (result.rows.length > 0) {
+            return {
+                id: result.rows[0].id,
+                name: result.rows[0].name,
+                emoji: result.rows[0].emoji || '⚔️',
+                memberCount: result.rows[0].member_count
+            };
+        }
+    }
+    return null;
+};
+
+// Start war matchmaking
+app.post('/api/wars/start', async (req, res) => {
+    const { guildId, playerId } = req.body;
+
+    if (!guildId || !playerId) {
+        return res.status(400).json({ error: 'Guild ID and Player ID required' });
+    }
+
+    try {
+        // Check if guild already in a war
+        if (guildToWar.has(guildId)) {
+            const existingWarId = guildToWar.get(guildId);
+            return res.json({
+                success: true,
+                warId: existingWarId,
+                war: activeWars.get(existingWarId),
+                alreadyInWar: true
+            });
+        }
+
+        // Check if guild is already in queue
+        const inQueue = warQueue.find(q => q.guildId === guildId);
+        if (inQueue) {
+            return res.json({ success: true, waiting: true, message: 'Already in matchmaking queue' });
+        }
+
+        // Get guild info
+        const guildInfo = await getGuildInfo(guildId);
+        if (!guildInfo) {
+            return res.status(404).json({ error: 'Guild not found' });
+        }
+
+        // Check if another guild is waiting
+        if (warQueue.length > 0) {
+            const opponent = warQueue.shift();
+
+            // Don't match with yourself
+            if (opponent.guildId === guildId) {
+                warQueue.push(opponent);
+                return res.json({ success: true, waiting: true, message: 'Waiting for opponent' });
+            }
+
+            // Create a new war!
+            const warId = uuidv4();
+            const now = new Date();
+            const endsAt = new Date(now.getTime() + 10 * 60 * 1000); // 10 minutes
+
+            const warState = {
+                id: warId,
+                guild1: guildInfo,
+                guild2: opponent.guildInfo,
+                scores: { guild1: 0, guild2: 0 },
+                attacks: [],
+                phase: 'battle',
+                startedAt: now.toISOString(),
+                endsAt: endsAt.toISOString(),
+                winner: null
+            };
+
+            activeWars.set(warId, warState);
+            guildToWar.set(guildId, warId);
+            guildToWar.set(opponent.guildId, warId);
+
+            // Notify both guilds
+            broadcastWarUpdate(warId, 'war_started', warState);
+
+            console.log(`⚔️ War started: ${guildInfo.name} vs ${opponent.guildInfo.name}`);
+
+            return res.json({ success: true, warId, war: warState, matched: true });
+        } else {
+            // Add to queue
+            warQueue.push({ guildId, guildInfo, playerId, joinedAt: Date.now() });
+            console.log(`⏳ ${guildInfo.name} waiting for war opponent...`);
+            return res.json({ success: true, waiting: true, message: 'Searching for opponent...' });
+        }
+    } catch (err) {
+        console.error('War start error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get active war for a guild
+app.get('/api/wars/active/:guildId', async (req, res) => {
+    const { guildId } = req.params;
+
+    try {
+        const warId = guildToWar.get(guildId);
+        if (!warId) {
+            // Check if in queue
+            const inQueue = warQueue.find(q => q.guildId === guildId);
+            return res.json({
+                war: null,
+                inQueue: !!inQueue,
+                queuePosition: inQueue ? warQueue.indexOf(inQueue) + 1 : 0
+            });
+        }
+
+        const war = activeWars.get(warId);
+        res.json({ war, warId });
+    } catch (err) {
+        console.error('Get active war error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Get war by ID
+app.get('/api/wars/:warId', async (req, res) => {
+    const { warId } = req.params;
+
+    try {
+        const war = activeWars.get(warId);
+        if (!war) {
+            return res.status(404).json({ error: 'War not found' });
+        }
+        res.json({ war });
+    } catch (err) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Attack in war
+app.post('/api/wars/:warId/attack', async (req, res) => {
+    const { warId } = req.params;
+    const { playerId, attackerGuildId, targetName, targetPower } = req.body;
+
+    try {
+        const war = activeWars.get(warId);
+        if (!war) {
+            return res.status(404).json({ error: 'War not found' });
+        }
+
+        if (war.phase !== 'battle') {
+            return res.status(400).json({ error: 'War has ended' });
+        }
+
+        // Determine which side the attacker is on
+        const isGuild1 = war.guild1.id === attackerGuildId;
+        const attackerGuild = isGuild1 ? war.guild1 : war.guild2;
+        const defenderGuild = isGuild1 ? war.guild2 : war.guild1;
+
+        // Calculate battle result (simple random for now)
+        const basePower = targetPower || 5000;
+        const attackPower = Math.floor(Math.random() * 10000) + 5000;
+        const winChance = Math.min(0.85, Math.max(0.15, attackPower / (attackPower + basePower)));
+        const won = Math.random() < winChance;
+        const stars = won ? Math.ceil(Math.random() * 3) : 0;
+        const damage = won ? Math.floor(basePower * (stars / 3)) : 0;
+
+        // Update scores
+        if (isGuild1) {
+            war.scores.guild1 += stars;
+        } else {
+            war.scores.guild2 += stars;
+        }
+
+        // Get attacker username
+        let attackerName = 'Unknown';
+        if (pool) {
+            const player = await pool.query('SELECT username FROM players WHERE id = $1', [playerId]);
+            if (player.rows.length > 0) attackerName = player.rows[0].username;
+        }
+
+        // Record attack
+        const attack = {
+            id: uuidv4(),
+            attacker: attackerName,
+            attackerGuildId,
+            target: targetName,
+            stars,
+            damage,
+            won,
+            timestamp: new Date().toISOString()
+        };
+        war.attacks.push(attack);
+
+        // Broadcast to all war participants
+        broadcastWarUpdate(warId, 'war_attack', {
+            attack,
+            scores: war.scores,
+            attackerGuildName: attackerGuild.name
+        });
+
+        console.log(`⚔️ ${attackerName} attacked ${targetName} → ${stars} stars`);
+
+        res.json({
+            success: true,
+            attack,
+            scores: war.scores,
+            won,
+            stars,
+            damage
+        });
+    } catch (err) {
+        console.error('War attack error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// End war
+app.post('/api/wars/:warId/end', async (req, res) => {
+    const { warId } = req.params;
+
+    try {
+        const war = activeWars.get(warId);
+        if (!war) {
+            return res.status(404).json({ error: 'War not found' });
+        }
+
+        // Determine winner
+        let winner = null;
+        if (war.scores.guild1 > war.scores.guild2) {
+            winner = war.guild1.id;
+        } else if (war.scores.guild2 > war.scores.guild1) {
+            winner = war.guild2.id;
+        }
+
+        war.phase = 'ended';
+        war.winner = winner;
+        war.endedAt = new Date().toISOString();
+
+        // Broadcast war ended
+        broadcastWarUpdate(warId, 'war_ended', {
+            winner,
+            winnerName: winner === war.guild1.id ? war.guild1.name :
+                winner === war.guild2.id ? war.guild2.name : 'Draw',
+            scores: war.scores,
+            rewards: winner ? { guildCoins: 500, gems: 50 } : { guildCoins: 100, gems: 10 }
+        });
+
+        // Clean up after a delay
+        setTimeout(() => {
+            guildToWar.delete(war.guild1.id);
+            guildToWar.delete(war.guild2.id);
+            activeWars.delete(warId);
+            console.log(`🏁 War ${warId} cleaned up`);
+        }, 60000); // 1 minute delay for results viewing
+
+        console.log(`🏆 War ended: ${war.guild1.name} (${war.scores.guild1}) vs ${war.guild2.name} (${war.scores.guild2})`);
+
+        res.json({
+            success: true,
+            winner,
+            scores: war.scores
+        });
+    } catch (err) {
+        console.error('End war error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Cancel matchmaking
+app.post('/api/wars/cancel', async (req, res) => {
+    const { guildId } = req.body;
+
+    const index = warQueue.findIndex(q => q.guildId === guildId);
+    if (index !== -1) {
+        warQueue.splice(index, 1);
+        console.log(`❌ ${guildId} left matchmaking queue`);
+    }
+
+    res.json({ success: true });
+});
+
+// Get matchmaking status
+app.get('/api/wars/queue/:guildId', async (req, res) => {
+    const { guildId } = req.params;
+
+    const inQueue = warQueue.find(q => q.guildId === guildId);
+    const inWar = guildToWar.get(guildId);
+
+    res.json({
+        inQueue: !!inQueue,
+        queuePosition: inQueue ? warQueue.indexOf(inQueue) + 1 : 0,
+        queueLength: warQueue.length,
+        inWar: !!inWar,
+        warId: inWar || null
+    });
+});
+
 
 // ================= START SERVER =================
 const PORT = process.env.PORT || 3001;
