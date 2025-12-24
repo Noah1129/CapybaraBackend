@@ -4,6 +4,12 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+// Simple password hashing (for a game - not production banking!)
+const hashPassword = (password) => {
+    return crypto.createHash('sha256').update(password).digest('hex');
+};
 
 // Database (PostgreSQL) - Optional
 const { Pool } = require('pg');
@@ -48,7 +54,9 @@ const initDB = async () => {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS players (
                 id VARCHAR(50) PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
+                username VARCHAR(50) NOT NULL,
+                password_hash VARCHAR(64) NOT NULL,
+                display_name VARCHAR(50) NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW(),
                 gold INTEGER DEFAULT 100,
                 gems INTEGER DEFAULT 100,
@@ -60,7 +68,8 @@ const initDB = async () => {
                 max_day_reached INTEGER DEFAULT 0,
                 max_combo INTEGER DEFAULT 0,
                 equipped_skin VARCHAR(50) DEFAULT 'none',
-                last_seen TIMESTAMP DEFAULT NOW()
+                last_seen TIMESTAMP DEFAULT NOW(),
+                UNIQUE(username)
             );
             
             CREATE TABLE IF NOT EXISTS leaderboard (
@@ -100,34 +109,72 @@ app.get('/', (req, res) => {
     res.json({ status: 'ok', game: 'Capybara Adventure', version: '1.0.0' });
 });
 
-// Register/Login player (simple - generates ID if new)
-app.post('/api/player/auth', async (req, res) => {
-    const { username } = req.body;
+// Register new player
+app.post('/api/player/register', async (req, res) => {
+    const { username, password, displayName } = req.body;
 
     if (!username || username.length < 3) {
         return res.status(400).json({ error: 'Username must be at least 3 characters' });
     }
+    if (!password || password.length < 4) {
+        return res.status(400).json({ error: 'Password must be at least 4 characters' });
+    }
 
     try {
-        // Check if player exists
-        let result = await pool.query('SELECT * FROM players WHERE username = $1', [username]);
-
-        if (result.rows.length > 0) {
-            // Existing player
-            await pool.query('UPDATE players SET last_seen = NOW() WHERE id = $1', [result.rows[0].id]);
-            return res.json({ player: result.rows[0], isNew: false });
+        // Check if username taken
+        const existing = await pool.query('SELECT id FROM players WHERE username = $1', [username.toLowerCase()]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: 'Username already taken' });
         }
 
-        // New player
+        // Create new player
         const playerId = uuidv4();
-        result = await pool.query(
-            'INSERT INTO players (id, username) VALUES ($1, $2) RETURNING *',
-            [playerId, username]
+        const passwordHash = hashPassword(password);
+        const result = await pool.query(
+            'INSERT INTO players (id, username, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING *',
+            [playerId, username.toLowerCase(), passwordHash, displayName || username]
         );
 
-        res.json({ player: result.rows[0], isNew: true });
+        // Don't send password hash to client
+        const player = { ...result.rows[0] };
+        delete player.password_hash;
+
+        res.json({ player, isNew: true });
     } catch (err) {
-        console.error('Auth error:', err);
+        console.error('Register error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Login player
+app.post('/api/player/login', async (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    try {
+        const passwordHash = hashPassword(password);
+        const result = await pool.query(
+            'SELECT * FROM players WHERE username = $1 AND password_hash = $2',
+            [username.toLowerCase(), passwordHash]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid username or password' });
+        }
+
+        // Update last seen
+        await pool.query('UPDATE players SET last_seen = NOW() WHERE id = $1', [result.rows[0].id]);
+
+        // Don't send password hash to client
+        const player = { ...result.rows[0] };
+        delete player.password_hash;
+
+        res.json({ player, isNew: false });
+    } catch (err) {
+        console.error('Login error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
