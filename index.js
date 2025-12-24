@@ -51,12 +51,13 @@ const initDB = async () => {
     }
 
     try {
+        // Create tables if they don't exist
         await pool.query(`
             CREATE TABLE IF NOT EXISTS players (
                 id VARCHAR(50) PRIMARY KEY,
                 username VARCHAR(50) NOT NULL,
-                password_hash VARCHAR(64) NOT NULL,
-                display_name VARCHAR(50) NOT NULL,
+                password_hash VARCHAR(64),
+                display_name VARCHAR(50),
                 created_at TIMESTAMP DEFAULT NOW(),
                 gold INTEGER DEFAULT 100,
                 gems INTEGER DEFAULT 100,
@@ -94,6 +95,16 @@ const initDB = async () => {
             CREATE INDEX IF NOT EXISTS idx_leaderboard_score ON leaderboard(score DESC);
             CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies DESC);
         `);
+
+        // Add missing columns for migration (safe - doesn't error if exists)
+        try {
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS password_hash VARCHAR(64);`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS display_name VARCHAR(50);`);
+            console.log('✅ Database migration complete');
+        } catch (migrationErr) {
+            console.log('⚠️ Migration skipped:', migrationErr.message);
+        }
+
         dbConnected = true;
         console.log('✅ Database initialized');
     } catch (err) {
