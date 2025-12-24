@@ -100,6 +100,27 @@ const initDB = async () => {
         try {
             await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS password_hash VARCHAR(64);`);
             await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS display_name VARCHAR(50);`);
+
+            // Inventory columns for cloud save
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS owned_items JSONB DEFAULT '[]';`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS owned_skins JSONB DEFAULT '["none"]';`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS owned_pets JSONB DEFAULT '[]';`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS equipped_weapon VARCHAR(50);`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS equipped_armor VARCHAR(50);`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS equipped_pet VARCHAR(50);`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS pity_counter INTEGER DEFAULT 0;`);
+            await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS achievements JSONB DEFAULT '[]';`);
+
+            // Friends table
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS friends (
+                    user_id VARCHAR(50) REFERENCES players(id),
+                    friend_id VARCHAR(50) REFERENCES players(id),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, friend_id)
+                );
+            `);
+
             console.log('✅ Database migration complete');
         } catch (migrationErr) {
             console.log('⚠️ Migration skipped:', migrationErr.message);
@@ -291,6 +312,214 @@ app.get('/api/pvp/leaderboard', async (req, res) => {
         );
         res.json(result.rows);
     } catch (err) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ================= CLOUD SAVE - INVENTORY =================
+
+// Get player inventory
+app.get('/api/player/:id/inventory', async (req, res) => {
+    const { id } = req.params;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT owned_items, owned_skins, owned_pets, equipped_weapon, equipped_armor, 
+             equipped_skin, equipped_pet, pity_counter, achievements
+             FROM players WHERE id = $1`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+
+        const player = result.rows[0];
+        res.json({
+            ownedItems: player.owned_items || [],
+            ownedSkins: player.owned_skins || ['none'],
+            ownedPets: player.owned_pets || [],
+            equipped: {
+                weapon: player.equipped_weapon || null,
+                armor: player.equipped_armor || null,
+                skin: player.equipped_skin || 'none',
+                pet: player.equipped_pet || null
+            },
+            pityCounter: player.pity_counter || 0,
+            achievements: player.achievements || []
+        });
+    } catch (err) {
+        console.error('Inventory fetch error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Save player inventory
+app.put('/api/player/:id/inventory', async (req, res) => {
+    const { id } = req.params;
+    const { ownedItems, ownedSkins, ownedPets, equipped, pityCounter, achievements } = req.body;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        await pool.query(
+            `UPDATE players SET 
+                owned_items = $1,
+                owned_skins = $2,
+                owned_pets = $3,
+                equipped_weapon = $4,
+                equipped_armor = $5,
+                equipped_skin = $6,
+                equipped_pet = $7,
+                pity_counter = $8,
+                achievements = $9,
+                last_seen = NOW()
+             WHERE id = $10`,
+            [
+                JSON.stringify(ownedItems || []),
+                JSON.stringify(ownedSkins || ['none']),
+                JSON.stringify(ownedPets || []),
+                equipped?.weapon || null,
+                equipped?.armor || null,
+                equipped?.skin || 'none',
+                equipped?.pet || null,
+                pityCounter || 0,
+                JSON.stringify(achievements || []),
+                id
+            ]
+        );
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Inventory save error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ================= MATCH HISTORY =================
+
+// Get player's match history
+app.get('/api/player/:id/matches', async (req, res) => {
+    const { id } = req.params;
+    const { limit = 10 } = req.query;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT m.*, 
+                    p1.username as player1_name, 
+                    p2.username as player2_name
+             FROM pvp_matches m
+             LEFT JOIN players p1 ON m.player1_id = p1.id
+             LEFT JOIN players p2 ON m.player2_id = p2.id
+             WHERE m.player1_id = $1 OR m.player2_id = $1
+             ORDER BY m.created_at DESC
+             LIMIT $2`,
+            [id, parseInt(limit)]
+        );
+
+        res.json(result.rows.map(match => ({
+            id: match.id,
+            opponent: match.player1_id === id ? match.player2_name : match.player1_name,
+            won: match.winner_id === id,
+            trophyChange: match.player1_id === id ? match.player1_trophies_change : match.player2_trophies_change,
+            date: match.created_at
+        })));
+    } catch (err) {
+        console.error('Match history error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ================= FRIENDS SYSTEM =================
+
+// Get friends list
+app.get('/api/player/:id/friends', async (req, res) => {
+    const { id } = req.params;
+
+    if (!dbConnected) {
+        return res.json([]); // Return empty if no DB
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT p.id, p.username, p.display_name, p.trophies, p.equipped_skin, p.last_seen
+             FROM friends f
+             JOIN players p ON f.friend_id = p.id
+             WHERE f.user_id = $1`,
+            [id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        // Table might not exist yet
+        res.json([]);
+    }
+});
+
+// Add friend
+app.post('/api/player/:id/friends', async (req, res) => {
+    const { id } = req.params;
+    const { friendUsername } = req.body;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        // Find friend by username
+        const friendResult = await pool.query(
+            'SELECT id FROM players WHERE username = $1',
+            [friendUsername]
+        );
+
+        if (friendResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+
+        const friendId = friendResult.rows[0].id;
+
+        if (friendId === id) {
+            return res.status(400).json({ error: 'Cannot add yourself' });
+        }
+
+        // Add friend (both directions for mutual friendship)
+        await pool.query(
+            'INSERT INTO friends (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            [id, friendId]
+        );
+
+        res.json({ success: true, friendId });
+    } catch (err) {
+        console.error('Add friend error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Remove friend  
+app.delete('/api/player/:id/friends/:friendId', async (req, res) => {
+    const { id, friendId } = req.params;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        await pool.query(
+            'DELETE FROM friends WHERE user_id = $1 AND friend_id = $2',
+            [id, friendId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Remove friend error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -492,6 +721,20 @@ io.on('connection', (socket) => {
             match.battleState.status = 'resolving';
             resolveTurn(matchId, match);
         }
+    });
+
+    // ==================== GLOBAL CHAT ====================
+    socket.on('chat:send', (data) => {
+        const { username, message } = data;
+        if (!username || !message || message.length > 200) return;
+
+        // Broadcast to all connected users
+        io.emit('chat:message', {
+            id: Date.now(),
+            username,
+            message: message.trim().slice(0, 200),
+            timestamp: new Date().toISOString()
+        });
     });
 
     socket.on('disconnect', () => {
