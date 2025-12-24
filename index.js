@@ -5,12 +5,23 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
-// Database (PostgreSQL)
+// Database (PostgreSQL) - Optional
 const { Pool } = require('pg');
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+let pool = null;
+let dbConnected = false;
+
+// Check if DATABASE_URL exists
+console.log('🔍 DATABASE_URL exists:', !!process.env.DATABASE_URL);
+console.log('🔍 DATABASE_URL value:', process.env.DATABASE_URL ? 'SET (hidden)' : 'NOT SET');
+
+if (process.env.DATABASE_URL) {
+    pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    });
+} else {
+    console.log('⚠️ No DATABASE_URL - running in memory-only mode');
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -28,6 +39,11 @@ app.use(express.json());
 
 // ================= DATABASE SETUP =================
 const initDB = async () => {
+    if (!pool) {
+        console.log('⚠️ Skipping DB init - no database connection');
+        return;
+    }
+
     try {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS players (
@@ -69,9 +85,11 @@ const initDB = async () => {
             CREATE INDEX IF NOT EXISTS idx_leaderboard_score ON leaderboard(score DESC);
             CREATE INDEX IF NOT EXISTS idx_players_trophies ON players(trophies DESC);
         `);
+        dbConnected = true;
         console.log('✅ Database initialized');
     } catch (err) {
-        console.error('❌ Database init error:', err);
+        console.error('❌ Database init error:', err.message);
+        console.log('⚠️ Server will run without database features');
     }
 };
 
