@@ -121,6 +121,18 @@ const initDB = async () => {
                 );
             `);
 
+            // Friend requests table
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS friend_requests (
+                    id SERIAL PRIMARY KEY,
+                    from_id VARCHAR(50) REFERENCES players(id),
+                    to_id VARCHAR(50) REFERENCES players(id),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(from_id, to_id)
+                );
+            `);
+
             console.log('✅ Database migration complete');
         } catch (migrationErr) {
             console.log('⚠️ Migration skipped:', migrationErr.message);
@@ -447,26 +459,50 @@ app.get('/api/player/:id/friends', async (req, res) => {
     const { id } = req.params;
 
     if (!dbConnected) {
-        return res.json([]); // Return empty if no DB
+        return res.json({ friends: [], pending: [], requests: [] });
     }
 
     try {
-        const result = await pool.query(
+        // Get confirmed friends
+        const friendsResult = await pool.query(
             `SELECT p.id, p.username, p.display_name, p.trophies, p.equipped_skin, p.last_seen
              FROM friends f
              JOIN players p ON f.friend_id = p.id
              WHERE f.user_id = $1`,
             [id]
         );
-        res.json(result.rows);
+
+        // Get pending requests I've sent
+        const pendingResult = await pool.query(
+            `SELECT fr.id as request_id, p.id, p.username, p.display_name, fr.created_at
+             FROM friend_requests fr
+             JOIN players p ON fr.to_id = p.id
+             WHERE fr.from_id = $1 AND fr.status = 'pending'`,
+            [id]
+        );
+
+        // Get requests others sent me
+        const requestsResult = await pool.query(
+            `SELECT fr.id as request_id, p.id, p.username, p.display_name, p.trophies, fr.created_at
+             FROM friend_requests fr
+             JOIN players p ON fr.from_id = p.id
+             WHERE fr.to_id = $1 AND fr.status = 'pending'`,
+            [id]
+        );
+
+        res.json({
+            friends: friendsResult.rows,
+            pending: pendingResult.rows,
+            requests: requestsResult.rows
+        });
     } catch (err) {
-        // Table might not exist yet
-        res.json([]);
+        console.error('Friends fetch error:', err);
+        res.json({ friends: [], pending: [], requests: [] });
     }
 });
 
-// Add friend
-app.post('/api/player/:id/friends', async (req, res) => {
+// Send friend request
+app.post('/api/player/:id/friends/request', async (req, res) => {
     const { id } = req.params;
     const { friendUsername } = req.body;
 
@@ -491,15 +527,93 @@ app.post('/api/player/:id/friends', async (req, res) => {
             return res.status(400).json({ error: 'Cannot add yourself' });
         }
 
-        // Add friend (both directions for mutual friendship)
+        // Check if already friends
+        const existingFriend = await pool.query(
+            'SELECT 1 FROM friends WHERE user_id = $1 AND friend_id = $2',
+            [id, friendId]
+        );
+        if (existingFriend.rows.length > 0) {
+            return res.status(400).json({ error: 'Already friends!' });
+        }
+
+        // Check if request already exists
+        const existingRequest = await pool.query(
+            'SELECT 1 FROM friend_requests WHERE from_id = $1 AND to_id = $2 AND status = \'pending\'',
+            [id, friendId]
+        );
+        if (existingRequest.rows.length > 0) {
+            return res.status(400).json({ error: 'Request already sent' });
+        }
+
+        // Create friend request
         await pool.query(
-            'INSERT INTO friends (user_id, friend_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            'INSERT INTO friend_requests (from_id, to_id, status) VALUES ($1, $2, \'pending\') ON CONFLICT (from_id, to_id) DO UPDATE SET status = \'pending\'',
             [id, friendId]
         );
 
-        res.json({ success: true, friendId });
+        res.json({ success: true, message: 'Friend request sent!' });
     } catch (err) {
-        console.error('Add friend error:', err);
+        console.error('Send request error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Accept friend request
+app.post('/api/player/:id/friends/accept/:requestId', async (req, res) => {
+    const { id, requestId } = req.params;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        // Get the request
+        const requestResult = await pool.query(
+            'SELECT from_id, to_id FROM friend_requests WHERE id = $1 AND to_id = $2 AND status = \'pending\'',
+            [requestId, id]
+        );
+
+        if (requestResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Request not found' });
+        }
+
+        const { from_id, to_id } = requestResult.rows[0];
+
+        // Add friendship both ways
+        await pool.query(
+            'INSERT INTO friends (user_id, friend_id) VALUES ($1, $2), ($2, $1) ON CONFLICT DO NOTHING',
+            [from_id, to_id]
+        );
+
+        // Mark request as accepted
+        await pool.query(
+            'UPDATE friend_requests SET status = \'accepted\' WHERE id = $1',
+            [requestId]
+        );
+
+        res.json({ success: true, message: 'Friend added!' });
+    } catch (err) {
+        console.error('Accept request error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Decline friend request
+app.post('/api/player/:id/friends/decline/:requestId', async (req, res) => {
+    const { id, requestId } = req.params;
+
+    if (!dbConnected) {
+        return res.status(503).json({ error: 'Database not available' });
+    }
+
+    try {
+        await pool.query(
+            'UPDATE friend_requests SET status = \'declined\' WHERE id = $1 AND to_id = $2',
+            [requestId, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Decline request error:', err);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -513,8 +627,9 @@ app.delete('/api/player/:id/friends/:friendId', async (req, res) => {
     }
 
     try {
+        // Remove both directions
         await pool.query(
-            'DELETE FROM friends WHERE user_id = $1 AND friend_id = $2',
+            'DELETE FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)',
             [id, friendId]
         );
         res.json({ success: true });
